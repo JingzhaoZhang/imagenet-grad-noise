@@ -161,7 +161,7 @@ def Hv_batch(net, criterion, batch_x, batch_y, v):
         res += torch.dot(v_i, grad_i.view(-1))
         idx += ng
 
-    Hv = autograd.grad(res, net.parameters()).detach()
+    Hv = autograd.grad(res, net.parameters())
     net.zero_grad()
     Hv = [t.data.cpu().view(-1) for t in Hv]
     Hv = torch.cat(Hv)
@@ -169,7 +169,7 @@ def Hv_batch(net, criterion, batch_x, batch_y, v):
 
 
 def power_method(v0, Av_func, n_iters=10, tol=1e-3, verbose=False):
-    mu = 0
+    mu = 1e-6
     v = v0/v0.norm()
     for i in range(n_iters):
         time_start = time.time()
