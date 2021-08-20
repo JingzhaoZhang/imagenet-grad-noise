@@ -145,6 +145,7 @@ def Hv_batch(net, criterion, batch_x, batch_y, v):
     """
     Hessian vector multiplication
     """
+    net.zero_grad()
     net.eval()
     output = net(batch_x)
     loss = criterion(output, batch_y)
@@ -160,7 +161,8 @@ def Hv_batch(net, criterion, batch_x, batch_y, v):
         res += torch.dot(v_i, grad_i.view(-1))
         idx += ng
 
-    Hv = autograd.grad(res, net.parameters())
+    Hv = autograd.grad(res, net.parameters()).detach()
+    net.zero_grad()
     Hv = [t.data.cpu().view(-1) for t in Hv]
     Hv = torch.cat(Hv)
     return Hv

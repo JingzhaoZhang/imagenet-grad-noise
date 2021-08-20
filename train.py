@@ -33,7 +33,7 @@ parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
                         ' (default: resnet18)')
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
-parser.add_argument('--epochs', default=50, type=int, metavar='N',
+parser.add_argument('--epochs', default=90, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
@@ -75,22 +75,20 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
                          'fastest way to use PyTorch for either single node or '
                          'multi node data parallel training')
 
-parser.add_argument( '--cosine', action='store_true',
-                    help='cosine lr')
+parser.add_argument( '-ls', '--lr_schedule', default='piecewise', type=str,
+                    help='piecewise | cosine | constant')
 parser.add_argument('-save_noise', action='store_true')
-parser.add_argument('-noise_per_iter', type=int, default=500)
+parser.add_argument('-noise_per_iter', type=int, default=6000)
 parser.add_argument('-save_noise_iter', action='store_true')
 parser.add_argument('--save-dir', type=str,  default='default',
                     help='path to save the final model')
-parser.add_argument('-noise_size', type=int, default=20)
+parser.add_argument('-noise_size', type=int, default=100)
 
 parser.add_argument('-save_sharpness', action='store_true')
-parser.add_argument('-sharpness_per_iter', type=int, default=1000)
-parser.add_argument('-sharpness_batches', type=int, default=20)
+parser.add_argument('-sharpness_per_iter', type=int, default=6000)
+parser.add_argument('-sharpness_batches', type=int, default=10)
 
 
-
-best_acc1 = 0
 
 
 def main():
@@ -134,13 +132,16 @@ def main():
 
 
 def main_worker(gpu, ngpus_per_node, args):
-    global best_acc1, log_train_file, log_valid_file
+    global best_acc1, log_train_file, log_valid_file, log_sharp_file, log_noise_file
+
     args.gpu = gpu
     
     
     save_dir = '../../logs/imagenet/' + args.save_dir + '/'
     log_train_file = save_dir + 'train.csv'
-    log_valid_file = save_dir + 'sharpness.csv'
+    log_valid_file = save_dir + 'valid.csv'
+    log_sharp_file = save_dir + 'sharpness.csv'
+    log_noise_file = save_dir + 'noise.csv'
 
     try:
         print('creating directory: %s' % save_dir)
@@ -205,10 +206,12 @@ def main_worker(gpu, ngpus_per_node, args):
             
     weight_names, weights = param_weights(model)
 
-    with open(log_train_file, 'w') as log_tf, open(log_valid_file, 'w') as log_vf:
-        log_tf.write('epoch,loss,gradnormsq,sto_grad_normsq,noisenormsq, l1, linf\n')
-        log_vf.write('epoch,sharpness,' +','.join(weight_names) + '\n')
-                
+    with open(log_train_file, 'w') as log_tf, open(log_valid_file, 'w') as log_vf, open(log_sharp_file, 'w') as log_sf, open(log_noise_file, 'w') as log_nf:
+        log_tf.write('epoch,loss,accu1\n')
+        log_nf.write('epoch,gradnormsq,sto_grad_normsq,noisenormsq, l1, linf\n')
+        log_sf.write('epoch,sharpness,' +','.join(weight_names) + '\n')
+        log_vf.write('epoch,valloss,valaccu\n')
+
             
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
@@ -216,11 +219,12 @@ def main_worker(gpu, ngpus_per_node, args):
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
     
-    if args.cosine:
+    
+    if args.lr_schedule == "cosine":
         print('using cosine with total step %d' % args.epochs * len(train_loader))
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer,
                     args.epochs * len(train_loader), eta_min=args.lr * 0.01)    
-
+ 
 
     # optionally resume from a checkpoint
     if args.resume:
@@ -292,13 +296,22 @@ def main_worker(gpu, ngpus_per_node, args):
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             train_sampler.set_epoch(epoch)
-        adjust_learning_rate(optimizer, epoch, args)
+            
+            
+        if args.lr_schedule == "piecewise":
+            adjust_learning_rate(optimizer, epoch, args)
+        elif args.lr_schedule == "cosine":
+            scheduler.step()
+            
+        if not args.multiprocessing_distributed or (args.multiprocessing_distributed
+                and args.rank % ngpus_per_node == 0):
+            save_stats(stats_loader, model, criterion, optimizer, epoch, args)
 
         # train for one epoch
         train(train_loader, stats_loader, model, criterion, optimizer, epoch, args)
 
         # evaluate on validation set
-        acc1 = validate(val_loader, model, criterion, args)
+        acc1 = validate(epoch, val_loader, model, criterion, args)
 
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
@@ -314,6 +327,8 @@ def main_worker(gpu, ngpus_per_node, args):
                 'optimizer' : optimizer.state_dict(),
             }, is_best)
 
+
+            
             
 def compute_grad_epoch(train_loader, model, criterion, optimizer, epoch, args):
     model.train()
@@ -389,11 +404,49 @@ def compute_sto_grad_norm(train_loader, model, criterion, optimizer, epoch, args
     optimizer.zero_grad()
     return noise_sq, stograd_sq, gradnorm_sq, true_gradnorml1, true_gradnormlinf     
 
+
+def save_stats(stats_loader, model, criterion, optimizer, epoch, args):
+    # switch to train mode
+    model.train()
+
+    if args.save_sharpness:
+        print("Saving sharpness")
+        optimizer.zero_grad()
+        sharpness = eigen_hessian(model, stats_loader, criterion, args.sharpness_batches)
+        weight_names, weights = param_weights(model)
+        weights_str = ['%4.4f' % w for w in weights]
+        
+
+    if args.save_noise:
+        print("Saving noise level")
+        optimizer.zero_grad()
+        true_gradnorm, sto_grad_norm, sto_noise_norm, true_gradnorml1, true_gradnormlinf = 0,0,0, 0, 0
+        noise_sq, stograd_sq, true_gradnorm, true_gradnorml1, true_gradnormlinf  = compute_sto_grad_norm(stats_loader, model, criterion, optimizer, epoch, args)
+        sto_grad_norm = np.mean(stograd_sq)
+        sto_noise_norm = np.mean(noise_sq)
+             
+    if args.save_sharpness:
+
+        with open(log_sharp_file, 'a') as log_vf:
+#                 log_tf.write('{epoch},{loss: 8.5f},{gradnorm:3.3f},{sto_grad_norm:3.3f},{noisenorm:3.3f}\n'.format(
+#                     epoch=train_step, loss=cur_loss,
+#                     gradnorm=true_gradnorm, sto_grad_norm=sto_grad_norm, noisenorm=sto_noise_norm))
+            log_vf.write('{epoch},{sharpness: 8.5f},'.format(epoch=epoch, sharpness=sharpness) + ','.join(weights_str) + '\n')     
+
+    if args.save_noise:
+
+        with open(log_noise_file, 'a') as log_tf:
+            log_tf.write('{epoch},{gradnorm:3.3f},{sto_grad_norm:3.3f},{noisenorm:3.3f},{l1norm:3.3f},{linfnorm:3.3f}\n'.format(
+                epoch=epoch,
+                gradnorm=true_gradnorm, sto_grad_norm=sto_grad_norm, 
+                noisenorm=sto_noise_norm, l1norm=true_gradnorml1, linfnorm=true_gradnormlinf))
+            
+
 def train(train_loader, stats_loader, model, criterion, optimizer, epoch, args):
-    batch_time = AverageMeter('Time', ':6.3f')
-    data_time = AverageMeter('Data', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
+    batch_time = AverageMeter('Time', ':6.3f')
+    data_time = AverageMeter('Data', ':6.3f')
     top5 = AverageMeter('Acc@5', ':6.2f')
     progress = ProgressMeter(
         len(train_loader),
@@ -403,34 +456,26 @@ def train(train_loader, stats_loader, model, criterion, optimizer, epoch, args):
     # switch to train mode
     model.train()
 
+    if args.save_sharpness:
+        print("Saving sharpness")
+        optimizer.zero_grad()
+        sharpness = eigen_hessian(model, stats_loader, criterion, args.sharpness_batches)
+        weight_names, weights = param_weights(model)
+        weights_str = ['%4.4f' % w for w in weights]
+        
+
+    if args.save_noise:
+        print("Saving noise level")
+        optimizer.zero_grad()
+        true_gradnorm, sto_grad_norm, sto_noise_norm, true_gradnorml1, true_gradnormlinf = 0,0,0, 0, 0
+        noise_sq, stograd_sq, true_gradnorm, true_gradnorml1, true_gradnormlinf  = compute_sto_grad_norm(stats_loader, model, criterion, optimizer, epoch, args)
+        sto_grad_norm = np.mean(stograd_sq)
+        sto_noise_norm = np.mean(noise_sq)
+
+                
     end = time.time()
     for i, (images, target) in enumerate(train_loader):
         
-        if args.save_sharpness and (i % args.sharpness_per_iter == 0):
-            print("Saving sharpness")
-            sharpness = eigen_hessian(model, stats_loader, criterion, args.sharpness_batches)
-            weight_names, weights = param_weights(model)
-            weights_str = ['%4.4f' % w for w in weights]
-            with open(log_valid_file, 'a') as log_vf:
-#                 log_tf.write('{epoch},{loss: 8.5f},{gradnorm:3.3f},{sto_grad_norm:3.3f},{noisenorm:3.3f}\n'.format(
-#                     epoch=train_step, loss=cur_loss,
-#                     gradnorm=true_gradnorm, sto_grad_norm=sto_grad_norm, noisenorm=sto_noise_norm))
-                log_vf.write('{epoch},{sharpness: 8.5f},'.format(epoch=epoch, sharpness=sharpness) + ','.join(weights_str) + '\n')     
-        
-        if args.save_noise and (i % args.noise_per_iter == 0):
-            print("Saving noise level")
-            true_gradnorm, sto_grad_norm, sto_noise_norm, true_gradnorml1, true_gradnormlinf = 0,0,0, 0, 0
-            noise_sq, stograd_sq, true_gradnorm, true_gradnorml1, true_gradnormlinf  = compute_sto_grad_norm(stats_loader, model, criterion, optimizer, epoch, args)
-            sto_grad_norm = np.mean(stograd_sq)
-            sto_noise_norm = np.mean(noise_sq)
-        
-
-            with open(log_train_file, 'a') as log_tf, open(log_valid_file, 'a') as log_vf:
-                log_tf.write('{epoch},{loss: 8.5f},{gradnorm:3.3f},{sto_grad_norm:3.3f},{noisenorm:3.3f},{l1norm:3.3f},{linfnorm:3.3f}\n'.format(
-                    epoch=epoch, loss=losses.avg,
-                    gradnorm=true_gradnorm, sto_grad_norm=sto_grad_norm, 
-                    noisenorm=sto_noise_norm, l1norm=true_gradnorml1, linfnorm=true_gradnormlinf))
-#                 log_vf.write('{epoch},{loss: 8.5f}\n'.format(
         
         # measure data loading time
         data_time.update(time.time() - end)
@@ -461,9 +506,31 @@ def train(train_loader, stats_loader, model, criterion, optimizer, epoch, args):
 
         if i % args.print_freq == 0:
             progress.display(i)
+    
+    
+    if not args.multiprocessing_distributed or (args.multiprocessing_distributed
+                                                and args.rank % ngpus_per_node == 0):
+        with open(log_train_file, 'a') as log_vf:
+            log_vf.write('{epoch},{loss: 8.5f},{accu: 8.5f}\n'.format(epoch=epoch, loss=losses.avg, accu=top1.avg))     
 
+#     if args.save_sharpness:
 
-def validate(val_loader, model, criterion, args):
+#         with open(log_sharp_file, 'a') as log_vf:
+# #                 log_tf.write('{epoch},{loss: 8.5f},{gradnorm:3.3f},{sto_grad_norm:3.3f},{noisenorm:3.3f}\n'.format(
+# #                     epoch=train_step, loss=cur_loss,
+# #                     gradnorm=true_gradnorm, sto_grad_norm=sto_grad_norm, noisenorm=sto_noise_norm))
+#             log_vf.write('{epoch},{sharpness: 8.5f},'.format(epoch=epoch, sharpness=sharpness) + ','.join(weights_str) + '\n')     
+
+#     if args.save_noise:
+
+#         with open(log_train_file, 'a') as log_tf:
+#             log_tf.write('{epoch},{loss: 8.5f},{gradnorm:3.3f},{sto_grad_norm:3.3f},{noisenorm:3.3f},{l1norm:3.3f},{linfnorm:3.3f}\n'.format(
+#                 epoch=epoch, loss=losses.avg,
+#                 gradnorm=true_gradnorm, sto_grad_norm=sto_grad_norm, 
+#                 noisenorm=sto_noise_norm, l1norm=true_gradnorml1, linfnorm=true_gradnormlinf))
+            
+
+def validate(epoch, val_loader, model, criterion, args):
     batch_time = AverageMeter('Time', ':6.3f')
     losses = AverageMeter('Loss', ':.4e')
     top1 = AverageMeter('Acc@1', ':6.2f')
@@ -504,6 +571,11 @@ def validate(val_loader, model, criterion, args):
         # TODO: this should also be done with the ProgressMeter
         print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
               .format(top1=top1, top5=top5))
+        
+    if not args.multiprocessing_distributed or (args.multiprocessing_distributed
+                                                and args.rank % ngpus_per_node == 0):
+        with open(log_valid_file, 'a') as log_vf:
+            log_vf.write('{epoch},{loss: 8.5f},{accu: 8.5f}\n'.format(epoch=epoch, loss=losses.avg, accu=top1.avg))     
 
     return top1.avg
 
@@ -557,7 +629,8 @@ class ProgressMeter(object):
 
 def adjust_learning_rate(optimizer, epoch, args):
     """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
-    lr = args.lr * (0.1 ** (epoch // 30))
+    lr = args.lr * (0.1 ** (epoch // int(args.epochs / 3)))
+    print("Epoch %d adjusted lr to be %f" % (epoch, lr))
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
@@ -580,4 +653,5 @@ def accuracy(output, target, topk=(1,)):
 
 
 if __name__ == '__main__':
+
     main()
