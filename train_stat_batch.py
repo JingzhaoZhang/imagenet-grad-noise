@@ -47,13 +47,11 @@ parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet101',
                         ' (default: resnet18)')
 parser.add_argument('-j', '--workers', default=8, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
-parser.add_argument('--epochs', default=90, type=int, metavar='N',
+parser.add_argument('--epochs', default=3, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
-parser.add_argument('--epoch_interval', '-ei', default=1, type=int, metavar='N',
-                    help='manual epoch number (useful on restarts)')
-parser.add_argument('-b', '--batch-size', default=128, type=int,
+parser.add_argument('-b', '--batch-size', default=64, type=int,
                     metavar='N',
                     help='mini-batch size (default: 256), this is the total '
                          'batch size of all GPUs on the current node when '
@@ -99,12 +97,12 @@ parser.add_argument('--save-dir', type=str,  default='default',
                     help='path to save the final model')
 parser.add_argument('--pretrain_path', type=str,  default='/com_space/tengjiaye/',
                     help='path to save the final model')
-parser.add_argument('-noise_size', type=int, default=40)
+parser.add_argument('-noise_size', type=int, default=10)
 
 parser.add_argument('-suppress', action='store_true')
 parser.add_argument('-save_sharpness', action='store_true')
 parser.add_argument('-sharpness_per_iter', type=int, default=6000)
-parser.add_argument('-sharpness_batches', type=int, default=40)
+parser.add_argument('-sharpness_batches', type=int, default=10)
 
 parser.add_argument('-p', '--print-freq', default=10, type=int,
                     metavar='N', help='print frequency (default: 10)')
@@ -362,7 +360,6 @@ def main_worker(gpu, ngpus_per_node, args):
     stats_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
         num_workers=args.workers, pin_memory=True, sampler=train_sampler)
-
     
     val_loader = torch.utils.data.DataLoader(
         datasets.ImageFolder(valdir, transforms.Compose([
@@ -377,50 +374,38 @@ def main_worker(gpu, ngpus_per_node, args):
     if args.evaluate:
         validate(val_loader, model, criterion, args)
         return
+    
+    
+    noise_size0, sharpness_batches0 = args.noise_size, args.sharpness_batches
+    
 
-    for epoch in range(args.start_epoch, args.epochs, args.epoch_interval):
+    for epoch in range(args.start_epoch, args.epochs):
         
-        pretrain_path = os.path.join(args.pretrain_path, args.arch+'_%d.pth' % (epoch+1))
-        load_model(pretrain_path, model, optimizer)
+        if epoch > 1:
+            pretrain_path = os.path.join(args.pretrain_path, args.arch+'_%d.pth' % (epoch))
+            load_model(pretrain_path, model, optimizer)
 
+            
         if args.distributed:
             train_sampler.set_epoch(epoch)
-            
             
         if args.lr_schedule == "piecewise":
             adjust_learning_rate(optimizer, epoch, args)
         elif args.lr_schedule == "cosine":
             scheduler.step()
+
+        for i in range(14):
+            args.noise_size, args.sharpness_batches = noise_size0 * 2**i, sharpness_batches0 * 2**i
+            print("epoch:%d, noise: %d, sharpness: %d" % (epoch, args.noise_size, args.sharpness_batches))
+            if not args.multiprocessing_distributed or (args.multiprocessing_distributed
+                    and args.rank % ngpus_per_node == 0):
+                save_stats(stats_loader, model, criterion, optimizer, epoch, args)
+
+            # train for one epoch
+            train(train_loader, stats_loader, model, criterion, optimizer, epoch, args)
             
-
-        
-        
-
-        if not args.multiprocessing_distributed or (args.multiprocessing_distributed
-                and args.rank % ngpus_per_node == 0):
-            save_stats(stats_loader, model, criterion, optimizer, epoch, args)
-
-            
-        # train for one epoch
-        train(train_loader, stats_loader, model, criterion, optimizer, epoch, args)
-
         # evaluate on validation set
         acc1 = validate(epoch, val_loader, model, criterion, args)
-
-        
-#         # remember best acc@1 and save checkpoint
-#         is_best = acc1 > best_acc1
-#         best_acc1 = max(acc1, best_acc1)
-
-#         if not args.multiprocessing_distributed or (args.multiprocessing_distributed
-#                 and args.rank % ngpus_per_node == 0):
-#             save_checkpoint({
-#                 'epoch': epoch + 1,
-#                 'arch': args.arch,
-#                 'state_dict': model.state_dict(),
-#                 'best_acc1': best_acc1,
-#                 'optimizer' : optimizer.state_dict(),
-#             }, is_best)
 
 
             
