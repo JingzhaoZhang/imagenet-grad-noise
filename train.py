@@ -1,5 +1,6 @@
 import argparse
 import os
+import sys
 import random
 import shutil
 import time
@@ -17,7 +18,20 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
+from models import *
 from utils import *
+import warnings
+warnings.filterwarnings("ignore")
+
+null = open(os.devnull,'wb')
+
+model_names = [
+    'alexnet', 'squeezenet1_0', 'squeezenet1_1', 'densenet121',
+    'densenet169', 'densenet201', 'densenet201', 'densenet161',
+    'vgg11', 'vgg11_bn', 'vgg13', 'vgg13_bn', 'vgg16', 'vgg16_bn',
+    'vgg19', 'vgg19_bn', 'resnet18', 'resnet34', 'resnet50', 'resnet101',
+    'resnet152'
+]
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -26,18 +40,18 @@ model_names = sorted(name for name in models.__dict__
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
 parser.add_argument('data', metavar='DIR',
                     help='path to dataset')
-parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
+parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet101',
                     choices=model_names,
                     help='model architecture: ' +
                         ' | '.join(model_names) +
                         ' (default: resnet18)')
-parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
+parser.add_argument('-j', '--workers', default=8, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
 parser.add_argument('--epochs', default=90, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
-parser.add_argument('-b', '--batch-size', default=256, type=int,
+parser.add_argument('-b', '--batch-size', default=128, type=int,
                     metavar='N',
                     help='mini-batch size (default: 256), this is the total '
                          'batch size of all GPUs on the current node when '
@@ -49,8 +63,7 @@ parser.add_argument('--momentum', default=0.9, type=float, metavar='M',
 parser.add_argument('--wd', '--weight-decay', default=1e-4, type=float,
                     metavar='W', help='weight decay (default: 1e-4)',
                     dest='weight_decay')
-parser.add_argument('-p', '--print-freq', default=10, type=int,
-                    metavar='N', help='print frequency (default: 10)')
+
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
 parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
@@ -77,25 +90,42 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
 
 parser.add_argument( '-ls', '--lr_schedule', default='piecewise', type=str,
                     help='piecewise | cosine | constant')
-parser.add_argument('-save_noise', action='store_true')
-parser.add_argument('-noise_per_iter', type=int, default=6000)
-parser.add_argument('-save_noise_iter', action='store_true')
-parser.add_argument('--save-dir', type=str,  default='default',
-                    help='path to save the final model')
-parser.add_argument('-noise_size', type=int, default=100)
+parser.add_argument('-p', '--print-freq', default=10, type=int,
+                    metavar='N', help='print frequency (default: 10)')
+
+parser.add_argument('-suppress', action='store_true')
 
 parser.add_argument('-save_sharpness', action='store_true')
-parser.add_argument('-sharpness_per_iter', type=int, default=6000)
 parser.add_argument('-sharpness_batches', type=int, default=10)
+parser.add_argument('-save_noise', action='store_true')
+parser.add_argument('--save-dir', type=str,  default='default',
+                    help='path to save the final model')
+parser.add_argument('--pretrain_path', type=str,  default='',
+                    help='path to save the final model')
+parser.add_argument('-noise_size', type=int, default=10)
+parser.add_argument('--epoch_interval', '-ei', default=1, type=int, metavar='N',
+                    help='manual epoch number (useful on restarts)')
 
 
 
+best_acc1 = 0
 
-def main():
+def load_model(path, model, optimizer):
+    print("=> loading checkpoint '{}'".format(path))
+    checkpoint = torch.load(path)
+    model.load_state_dict(checkpoint['state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer'])
+    print("=> loaded checkpoint '{}'".format(path))
+
     
+    
+def main():
     
     args = parser.parse_args()
 
+    if args.suppress:
+        sys.stderr = null
+        
     if args.seed is not None:
         random.seed(args.seed)
         torch.manual_seed(args.seed)
@@ -131,13 +161,15 @@ def main():
         main_worker(args.gpu, ngpus_per_node, args)
 
 
+        
+        
 def main_worker(gpu, ngpus_per_node, args):
     global best_acc1, log_train_file, log_valid_file, log_sharp_file, log_noise_file
 
     args.gpu = gpu
     
     
-    save_dir = '../../logs/imagenet/' + args.save_dir + '/'
+    save_dir = '/home/zhangjingzhao/logs/imagenet_stat/' + args.save_dir + '/'
     log_train_file = save_dir + 'train.csv'
     log_valid_file = save_dir + 'valid.csv'
     log_sharp_file = save_dir + 'sharpness.csv'
@@ -164,13 +196,64 @@ def main_worker(gpu, ngpus_per_node, args):
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                 world_size=args.world_size, rank=args.rank)
     # create model
+#     if args.pretrained:
+#         print("=> using pre-trained model '{}'".format(args.arch))
+#         model = models.__dict__[args.arch](pretrained=True)
+#     else:
+#         print("=> creating model '{}'".format(args.arch))
+#         model = models.__dict__[args.arch]()
+
     if args.pretrained:
         print("=> using pre-trained model '{}'".format(args.arch))
-        model = models.__dict__[args.arch](pretrained=True)
     else:
         print("=> creating model '{}'".format(args.arch))
-        model = models.__dict__[args.arch]()
 
+    if args.arch == 'alexnet':
+        model = alexnet(pretrained=args.pretrained)
+    elif args.arch == 'squeezenet1_0':
+        model = squeezenet1_0(pretrained=args.pretrained)
+    elif args.arch == 'squeezenet1_1':
+        model = squeezenet1_1(pretrained=args.pretrained)
+    elif args.arch == 'densenet121':
+        model = densenet121(pretrained=args.pretrained)
+    elif args.arch == 'densenet169':
+        model = densenet169(pretrained=args.pretrained)
+    elif args.arch == 'densenet201':
+        model = densenet201(pretrained=args.pretrained)
+    elif args.arch == 'densenet161':
+        model = densenet161(pretrained=args.pretrained)
+    elif args.arch == 'vgg11':
+        model = vgg11(pretrained=args.pretrained)
+    elif args.arch == 'vgg13':
+        model = vgg13(pretrained=args.pretrained)
+    elif args.arch == 'vgg16':
+        model = vgg16(pretrained=args.pretrained)
+    elif args.arch == 'vgg19':
+        model = vgg19(pretrained=args.pretrained)
+    elif args.arch == 'vgg11_bn':
+        model = vgg11_bn(pretrained=args.pretrained)
+    elif args.arch == 'vgg13_bn':
+        model = vgg13_bn(pretrained=args.pretrained)
+    elif args.arch == 'vgg16_bn':
+        model = vgg16_bn(pretrained=args.pretrained)
+    elif args.arch == 'vgg19_bn':
+        model = vgg19_bn(pretrained=args.pretrained)
+    elif args.arch == 'resnet18':
+        model = resnet18(pretrained=args.pretrained)
+    elif args.arch == 'resnet34':
+        model = resnet34(pretrained=args.pretrained)
+    elif args.arch == 'resnet50':
+        model = resnet50(pretrained=args.pretrained)
+    elif args.arch == 'resnet101':
+        model = resnet101(pretrained=args.pretrained)
+    elif args.arch == 'resnet152':
+        model = resnet152(pretrained=args.pretrained)
+    else:
+        raise NotImplementedError
+        
+        
+      
+        
     if not torch.cuda.is_available():
         print('using CPU, this will be slow')
     elif args.distributed:
@@ -204,13 +287,14 @@ def main_worker(gpu, ngpus_per_node, args):
 
 
             
-    weight_names, weights = param_weights(model)
+#     weight_names, weights = param_weights(model)
 
     with open(log_train_file, 'w') as log_tf, open(log_valid_file, 'w') as log_vf, open(log_sharp_file, 'w') as log_sf, open(log_noise_file, 'w') as log_nf:
         log_tf.write('epoch,loss,accu1\n')
         log_nf.write('epoch,gradnormsq,sto_grad_normsq,noisenormsq, l1, linf\n')
-        log_sf.write('epoch,sharpness,' +','.join(weight_names) + '\n')
+#         log_sf.write('epoch,sharpness,' +','.join(weight_names) + '\n')
         log_vf.write('epoch,valloss,valaccu\n')
+        log_sf.write('epoch,sharpness,' + '\n')
 
             
     # define loss function (criterion) and optimizer
@@ -294,6 +378,12 @@ def main_worker(gpu, ngpus_per_node, args):
         return
 
     for epoch in range(args.start_epoch, args.epochs):
+        
+        
+        if args.pretrain_path and epoch % args.epoch_interval == 0:
+            pretrain_path = os.path.join(args.pretrain_path, args.arch+'_%d.pth' % (epoch+1))
+            load_model(pretrain_path, model, optimizer)
+
         if args.distributed:
             train_sampler.set_epoch(epoch)
             
@@ -303,9 +393,7 @@ def main_worker(gpu, ngpus_per_node, args):
         elif args.lr_schedule == "cosine":
             scheduler.step()
             
-        if not args.multiprocessing_distributed or (args.multiprocessing_distributed
-                and args.rank % ngpus_per_node == 0):
-            save_stats(stats_loader, model, criterion, optimizer, epoch, args)
+
 
         # train for one epoch
         train(train_loader, stats_loader, model, criterion, optimizer, epoch, args)
@@ -313,20 +401,11 @@ def main_worker(gpu, ngpus_per_node, args):
         # evaluate on validation set
         acc1 = validate(epoch, val_loader, model, criterion, args)
 
-        # remember best acc@1 and save checkpoint
-        is_best = acc1 > best_acc1
-        best_acc1 = max(acc1, best_acc1)
+        if (not args.multiprocessing_distributed or (args.multiprocessing_distributed
+                and args.rank % ngpus_per_node == 0)) and (epoch % args.epoch_interval == 0):
+            save_stats(stats_loader, copy.deepcopy(model), criterion, optimizer, epoch, args)
 
-        if not args.multiprocessing_distributed or (args.multiprocessing_distributed
-                and args.rank % ngpus_per_node == 0):
-            save_checkpoint({
-                'epoch': epoch + 1,
-                'arch': args.arch,
-                'state_dict': model.state_dict(),
-                'best_acc1': best_acc1,
-                'optimizer' : optimizer.state_dict(),
-            }, is_best)
-
+            
 
             
             
@@ -343,6 +422,7 @@ def compute_grad_epoch(train_loader, model, criterion, optimizer, epoch, args):
             target = target.cuda(args.gpu, non_blocking=True)
 
         # compute output
+        
         output = model(images)
         loss = criterion(output, target) / args.noise_size
 
@@ -350,8 +430,6 @@ def compute_grad_epoch(train_loader, model, criterion, optimizer, epoch, args):
 
         # compute gradient and do SGD step
         loss.backward()
-        optimizer.step()
-
 
 
         if i == args.noise_size - 1:
@@ -361,7 +439,8 @@ def compute_grad_epoch(train_loader, model, criterion, optimizer, epoch, args):
     clone_grad(model, true_grad)
     optimizer.zero_grad()
     return true_grad        
-        
+
+
             
 def compute_sto_grad_norm(train_loader, model, criterion, optimizer, epoch, args):
     noise_sq = []
@@ -382,6 +461,7 @@ def compute_sto_grad_norm(train_loader, model, criterion, optimizer, epoch, args
             target = target.cuda(args.gpu, non_blocking=True)
 
         # compute output
+        optimizer.zero_grad()
         output = model(images)
         loss = criterion(output, target) 
 
@@ -389,7 +469,6 @@ def compute_sto_grad_norm(train_loader, model, criterion, optimizer, epoch, args
 
         # compute gradient and do SGD step
         loss.backward()
-        optimizer.step()
 
         sto_grads = {}
         clone_grad(model, sto_grads)
@@ -413,8 +492,8 @@ def save_stats(stats_loader, model, criterion, optimizer, epoch, args):
         print("Saving sharpness")
         optimizer.zero_grad()
         sharpness = eigen_hessian(model, stats_loader, criterion, args.sharpness_batches)
-        weight_names, weights = param_weights(model)
-        weights_str = ['%4.4f' % w for w in weights]
+#         weight_names, weights = param_weights(model)
+#         weights_str = ['%4.4f' % w for w in weights]
         
 
     if args.save_noise:
@@ -428,10 +507,8 @@ def save_stats(stats_loader, model, criterion, optimizer, epoch, args):
     if args.save_sharpness:
 
         with open(log_sharp_file, 'a') as log_vf:
-#                 log_tf.write('{epoch},{loss: 8.5f},{gradnorm:3.3f},{sto_grad_norm:3.3f},{noisenorm:3.3f}\n'.format(
-#                     epoch=train_step, loss=cur_loss,
-#                     gradnorm=true_gradnorm, sto_grad_norm=sto_grad_norm, noisenorm=sto_noise_norm))
-            log_vf.write('{epoch},{sharpness: 8.5f},'.format(epoch=epoch, sharpness=sharpness) + ','.join(weights_str) + '\n')     
+            log_vf.write('{epoch},{sharpness: 8.5f},'.format(epoch=epoch, sharpness=sharpness) + '\n')     
+  
 
     if args.save_noise:
 
@@ -455,23 +532,6 @@ def train(train_loader, stats_loader, model, criterion, optimizer, epoch, args):
 
     # switch to train mode
     model.train()
-
-    if args.save_sharpness:
-        print("Saving sharpness")
-        optimizer.zero_grad()
-        sharpness = eigen_hessian(model, stats_loader, criterion, args.sharpness_batches)
-        weight_names, weights = param_weights(model)
-        weights_str = ['%4.4f' % w for w in weights]
-        
-
-    if args.save_noise:
-        print("Saving noise level")
-        optimizer.zero_grad()
-        true_gradnorm, sto_grad_norm, sto_noise_norm, true_gradnorml1, true_gradnormlinf = 0,0,0, 0, 0
-        noise_sq, stograd_sq, true_gradnorm, true_gradnorml1, true_gradnormlinf  = compute_sto_grad_norm(stats_loader, model, criterion, optimizer, epoch, args)
-        sto_grad_norm = np.mean(stograd_sq)
-        sto_noise_norm = np.mean(noise_sq)
-
                 
     end = time.time()
     for i, (images, target) in enumerate(train_loader):
@@ -497,8 +557,9 @@ def train(train_loader, stats_loader, model, criterion, optimizer, epoch, args):
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        if not args.pretrain_path:
+            loss.backward()
+            optimizer.step()
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -506,28 +567,13 @@ def train(train_loader, stats_loader, model, criterion, optimizer, epoch, args):
 
         if i % args.print_freq == 0:
             progress.display(i)
-    
+        
     
     if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                                                 and args.rank % ngpus_per_node == 0):
         with open(log_train_file, 'a') as log_vf:
             log_vf.write('{epoch},{loss: 8.5f},{accu: 8.5f}\n'.format(epoch=epoch, loss=losses.avg, accu=top1.avg))     
 
-#     if args.save_sharpness:
-
-#         with open(log_sharp_file, 'a') as log_vf:
-# #                 log_tf.write('{epoch},{loss: 8.5f},{gradnorm:3.3f},{sto_grad_norm:3.3f},{noisenorm:3.3f}\n'.format(
-# #                     epoch=train_step, loss=cur_loss,
-# #                     gradnorm=true_gradnorm, sto_grad_norm=sto_grad_norm, noisenorm=sto_noise_norm))
-#             log_vf.write('{epoch},{sharpness: 8.5f},'.format(epoch=epoch, sharpness=sharpness) + ','.join(weights_str) + '\n')     
-
-#     if args.save_noise:
-
-#         with open(log_train_file, 'a') as log_tf:
-#             log_tf.write('{epoch},{loss: 8.5f},{gradnorm:3.3f},{sto_grad_norm:3.3f},{noisenorm:3.3f},{l1norm:3.3f},{linfnorm:3.3f}\n'.format(
-#                 epoch=epoch, loss=losses.avg,
-#                 gradnorm=true_gradnorm, sto_grad_norm=sto_grad_norm, 
-#                 noisenorm=sto_noise_norm, l1norm=true_gradnorml1, linfnorm=true_gradnormlinf))
             
 
 def validate(epoch, val_loader, model, criterion, args):
@@ -568,7 +614,7 @@ def validate(epoch, val_loader, model, criterion, args):
             if i % args.print_freq == 0:
                 progress.display(i)
 
-        # TODO: this should also be done with the ProgressMeter
+
         print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
               .format(top1=top1, top5=top5))
         
