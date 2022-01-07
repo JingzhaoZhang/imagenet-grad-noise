@@ -9,12 +9,16 @@ import numpy as np
 def compute_noise(stoc_grads, true_grads):
     total_noise_sq = 0 
     total_grad_sq = 0
+    total_grad_inf = 0
     for k in stoc_grads.keys():
         total_noise_sq += (stoc_grads[k]- true_grads[k]).norm(2).item() ** 2
         total_grad_sq += stoc_grads[k].norm(2).item() ** 2
-    return total_noise_sq, total_grad_sq
+        total_grad_inf = max(total_grad_inf, torch.max(torch.abs(stoc_grads[k])).item())
+
+    return total_noise_sq, total_grad_sq, total_grad_inf
 
 def compute_norm(grads):
+
     total_grad_sq = 0
     for k in grads.keys():
         total_grad_sq += grads[k].norm(2).item() ** 2
@@ -30,7 +34,7 @@ def compute_l1norm(grads):
 def compute_linfnorm(grads):
     total_grad_inf = 0
     for k in grads.keys():
-        total_grad_inf = max(total_grad_inf, torch.max(torch.abs(grads[k])))
+        total_grad_inf = max(total_grad_inf, torch.max(torch.abs(grads[k])).item())
     return total_grad_inf
 
 
@@ -96,23 +100,32 @@ def save_checkpoint(model, optimizer, path, epoch):
 
 
 
-def eigen_variance(net, criterion, dataloader, n_iters=10, tol=1e-2, verbose=False):
+def eigen_variance(net, criterion, dataloader, n_iters=5, tol=1e-2, verbose=False):
     n_parameters = num_parameters(net)
     v0 = torch.randn(n_parameters)
-
     Av_func = lambda v: variance_vec_prod(net, criterion, dataloader, v)
     mu = power_method(v0, Av_func, n_iters, tol, verbose)
     return mu
 
 
-def eigen_hessian(net, dataloader, criterion, batches, n_iters=10, tol=1e-2, verbose=False):
+def eigen_hessian(net, dataloader, criterion, batches, n_iters=5, tol=1e-2, verbose=False):
     n_parameters = num_parameters(net)
-    v0 = torch.randn(n_parameters)
-
+    v0 = torch.randn(n_parameters).cuda()
     Av_func = lambda v: hessian_vec_prod(net, dataloader, criterion, batches, v)
     mu = power_method(v0, Av_func, n_iters, tol, verbose)
     return mu
 
+def dir_hessian(net, dataloader, criterion, batches):
+    sharpness = 0    
+    n_batchs = batches #len(dataloader)
+    for i in range(batches):
+        # print("dir_hessian iter %d" % i)
+        bx, by = next(dataloader)
+        net.zero_grad()
+        sharpness += dir_sharpness_batch(net, criterion, bx.cuda(), by.cuda())
+        if i == batches - 1:
+            break
+    return sharpness/n_batchs
 
 def variance_vec_prod(net, criterion, dataloader, v):
     X, y = dataloader.X, dataloader.y
@@ -133,7 +146,8 @@ def variance_vec_prod(net, criterion, dataloader, v):
 def hessian_vec_prod(net, dataloader, criterion, batches, v):
     Hv_t = 0
     n_batchs = batches #len(dataloader)
-    for i, (bx, by) in enumerate(dataloader):
+    for i in range(batches):
+        bx, by = next(dataloader)
         Hv= Hv_batch(net, criterion, bx.cuda(), by.cuda(), v)
         Hv_t += Hv
         if i == batches - 1:
@@ -146,7 +160,7 @@ def Hv_batch(net, criterion, batch_x, batch_y, v):
     Hessian vector multiplication
     """
     net.zero_grad()
-    net.eval()
+    # net.eval()
     output = net(batch_x)
     loss = criterion(output, batch_y)
 
@@ -157,32 +171,55 @@ def Hv_batch(net, criterion, batch_x, batch_y, v):
     idx, res = 0, 0
     for grad_i in grads:
         ng = torch.numel(grad_i)
-        v_i = v[idx:idx+ng].cuda()
+        v_i = v[idx:idx+ng]
         res += torch.dot(v_i, grad_i.view(-1))
         idx += ng
 
     Hv = autograd.grad(res, net.parameters())
     net.zero_grad()
-    Hv = [t.data.cpu().view(-1) for t in Hv]
+    Hv = [t.view(-1) for t in Hv]
     Hv = torch.cat(Hv)
     return Hv
 
+def dir_sharpness_batch(net, criterion, batch_x, batch_y):
+    """
+    Hessian vector multiplication
+    """
+    net.zero_grad()
+    output = net(batch_x)
+    loss = criterion(output, batch_y)
 
-def power_method(v0, Av_func, n_iters=10, tol=1e-3, verbose=False):
+#     loss = criterion(logits, batch_y)
+#     loss = loss.float().mean().type_as(loss)
+
+    grads = autograd.grad(loss, net.parameters(), create_graph=True, retain_graph=True)
+    idx, res = 0, 0
+    for grad_i in grads:
+        # v_i = v[idx:idx+ng].cuda()
+        res += torch.square(torch.norm(grad_i))
+    Hv = autograd.grad(res, net.parameters())
+    net.zero_grad()
+    Hv = [t.view(-1) for t in Hv]
+    Hv = torch.cat(Hv)
+    stograds = [t.view(-1) for t in grads]
+    stograds = torch.cat(stograds)
+    sharpness = Hv.norm()/stograds.norm()
+    return sharpness.item()
+
+
+
+def power_method(v0, Av_func, n_iters=5, tol=1e-3, verbose=False):
     mu = 1e-6
     v = v0/v0.norm()
     for i in range(n_iters):
-        time_start = time.time()
-
         Av = Av_func(v)
         mu_pre = mu
         mu = torch.dot(Av,v).item()
         v = Av/Av.norm()
-
+        # print("power iter %d, mu %f" % (i, mu))
         if abs(mu-mu_pre)/abs(mu) < tol:
             break
-        if verbose:
-            print('%d-th step takes %.0f seconds, \t %.2e'%(i+1,time.time()-time_start,mu))
+        
     return mu
 
 

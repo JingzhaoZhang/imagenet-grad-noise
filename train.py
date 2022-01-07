@@ -4,6 +4,7 @@ import sys
 import random
 import shutil
 import time
+import copy
 import warnings
 import errno
 import torch
@@ -40,7 +41,7 @@ model_names = sorted(name for name in models.__dict__
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
 parser.add_argument('data', metavar='DIR',
                     help='path to dataset')
-parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet101',
+parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet34',
                     choices=model_names,
                     help='model architecture: ' +
                         ' | '.join(model_names) +
@@ -91,7 +92,11 @@ parser.add_argument('--multiprocessing-distributed', action='store_true',
 parser.add_argument( '-ls', '--lr_schedule', default='piecewise', type=str,
                     help='piecewise | cosine | constant')
 parser.add_argument('-p', '--print-freq', default=10, type=int,
-                    metavar='N', help='print frequency (default: 10)')
+                    metavar='N', help='print frequency (default: 1/10 iteration)')
+parser.add_argument('-ef', '--eval-freq', default=5, type=int,
+                    metavar='N', help='evaluation frequency (default: 1 / 5 epoch)')
+parser.add_argument('-sf', '--stat-freq', default=2000, type=int,
+                    metavar='N', help='stat evaluation frequency (default: 1 / 2000 iteration)')
 
 parser.add_argument('-suppress', action='store_true')
 
@@ -169,7 +174,7 @@ def main_worker(gpu, ngpus_per_node, args):
     args.gpu = gpu
     
     
-    save_dir = '/home/zhangjingzhao/logs/imagenet_stat/' + args.save_dir + '/'
+    save_dir = args.save_dir + '/'
     log_train_file = save_dir + 'train.csv'
     log_valid_file = save_dir + 'valid.csv'
     log_sharp_file = save_dir + 'sharpness.csv'
@@ -291,10 +296,10 @@ def main_worker(gpu, ngpus_per_node, args):
 
     with open(log_train_file, 'w') as log_tf, open(log_valid_file, 'w') as log_vf, open(log_sharp_file, 'w') as log_sf, open(log_noise_file, 'w') as log_nf:
         log_tf.write('epoch,loss,accu1\n')
-        log_nf.write('epoch,gradnormsq,sto_grad_normsq,noisenormsq, l1, linf\n')
+        log_nf.write('epoch,sto_grad_norm,stograd_linf,noisenorm,gradnorm,l1norm,linfnorm, update_size, change_in_grad_sq\n')
 #         log_sf.write('epoch,sharpness,' +','.join(weight_names) + '\n')
         log_vf.write('epoch,valloss,valaccu\n')
-        log_sf.write('epoch,sharpness,' + '\n')
+        log_sf.write('epoch,sharpness, dir_sharpness' + '\n')
 
             
     # define loss function (criterion) and optimizer
@@ -355,12 +360,12 @@ def main_worker(gpu, ngpus_per_node, args):
         train_sampler = None
 
     train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler)
+        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None), prefetch_factor=4,
+        num_workers=args.workers, pin_memory=True, sampler=train_sampler, persistent_workers=True)
 
     stats_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler)
+        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None), prefetch_factor=4,
+        num_workers=args.workers, pin_memory=True, sampler=train_sampler, persistent_workers=True)
 
     
     val_loader = torch.utils.data.DataLoader(
@@ -392,29 +397,27 @@ def main_worker(gpu, ngpus_per_node, args):
             adjust_learning_rate(optimizer, epoch, args)
         elif args.lr_schedule == "cosine":
             scheduler.step()
-            
-
 
         # train for one epoch
         train(train_loader, stats_loader, model, criterion, optimizer, epoch, args)
 
+        
         # evaluate on validation set
-        acc1 = validate(epoch, val_loader, model, criterion, args)
+        if epoch % args.eval_freq == 0:
+            acc1 = validate(epoch, val_loader, model, criterion, args)
 
-        if (not args.multiprocessing_distributed or (args.multiprocessing_distributed
-                and args.rank % ngpus_per_node == 0)) and (epoch % args.epoch_interval == 0):
-            save_stats(stats_loader, copy.deepcopy(model), criterion, optimizer, epoch, args)
+        # if (not args.multiprocessing_distributed or (args.multiprocessing_distributed
+        #         and args.rank % ngpus_per_node == 0)) and (epoch % args.epoch_interval == 0):
+        #     save_stats(stats_loader, copy.deepcopy(model), criterion, optimizer, epoch, args)
 
             
-
             
-            
-def compute_grad_epoch(train_loader, model, criterion, optimizer, epoch, args):
+def compute_grad_epoch(dataloader, model, criterion, optimizer, epoch, args):
     model.train()
-    optimizer.zero_grad()
+    model.zero_grad()
     
-    for i, (images, target) in enumerate(train_loader):
-        # measure data loading time
+    for i in range(args.noise_size):
+        images, target = next(dataloader)        # measure data loading time
 
         if args.gpu is not None:
             images = images.cuda(args.gpu, non_blocking=True)
@@ -437,22 +440,26 @@ def compute_grad_epoch(train_loader, model, criterion, optimizer, epoch, args):
             
     true_grad = {}
     clone_grad(model, true_grad)
-    optimizer.zero_grad()
+    model.zero_grad()
     return true_grad        
 
 
             
-def compute_sto_grad_norm(train_loader, model, criterion, optimizer, epoch, args):
+def compute_sto_grad_norm(dataloader, model, criterion, optimizer, epoch, args, prev_true_grad):
     noise_sq = []
     stograd_sq = []
+    stograd_linf = []
+
     # Turn on training mode which enables dropout.
     model.train()
-    true_grads = compute_grad_epoch(train_loader, model, criterion, optimizer, epoch, args)
+    true_grads = compute_grad_epoch(dataloader, model, criterion, optimizer, epoch, args)
+    grad_change_sq, _, _ = compute_noise(true_grads, prev_true_grad)
     gradnorm_sq = compute_norm(true_grads) 
     true_gradnorml1 = compute_l1norm(true_grads) 
     true_gradnormlinf = compute_linfnorm(true_grads) 
 
-    for i, (images, target) in enumerate(train_loader):
+    for i in range(args.noise_size):
+        images, target = next(dataloader)
         # measure data loading time
 
         if args.gpu is not None:
@@ -461,7 +468,7 @@ def compute_sto_grad_norm(train_loader, model, criterion, optimizer, epoch, args
             target = target.cuda(args.gpu, non_blocking=True)
 
         # compute output
-        optimizer.zero_grad()
+        model.zero_grad()
         output = model(images)
         loss = criterion(output, target) 
 
@@ -472,51 +479,55 @@ def compute_sto_grad_norm(train_loader, model, criterion, optimizer, epoch, args
 
         sto_grads = {}
         clone_grad(model, sto_grads)
-        instance_noisesq, instance_gradsq = compute_noise(sto_grads, true_grads)
+        instance_noisesq, instance_gradsq, instance_gradlinf = compute_noise(sto_grads, true_grads)
         noise_sq.append(instance_noisesq)
         stograd_sq.append(instance_gradsq)
-        
+        stograd_linf.append(instance_gradlinf)
+
         if i == args.noise_size - 1:
             break
-            
 
-    optimizer.zero_grad()
-    return noise_sq, stograd_sq, gradnorm_sq, true_gradnorml1, true_gradnormlinf     
+    model.zero_grad()
+    return noise_sq, stograd_sq, stograd_linf, gradnorm_sq, true_gradnorml1, true_gradnormlinf, grad_change_sq    
 
 
-def save_stats(stats_loader, model, criterion, optimizer, epoch, args):
+def save_stats(stats_loader, model, criterion, optimizer, epoch, args, prev_true_grad, update_size):
     # switch to train mode
     model.train()
+    stats_iterator = iter(stats_loader)
 
     if args.save_sharpness:
         print("Saving sharpness")
-        optimizer.zero_grad()
-        sharpness = eigen_hessian(model, stats_loader, criterion, args.sharpness_batches)
+        model.zero_grad()
+        dir_sharpness = dir_hessian(model, stats_iterator, criterion, args.sharpness_batches)
+        model.zero_grad()
+        sharpness = eigen_hessian(model, stats_iterator, criterion, args.sharpness_batches)
+
 #         weight_names, weights = param_weights(model)
 #         weights_str = ['%4.4f' % w for w in weights]
         
 
     if args.save_noise:
         print("Saving noise level")
-        optimizer.zero_grad()
-        true_gradnorm, sto_grad_norm, sto_noise_norm, true_gradnorml1, true_gradnormlinf = 0,0,0, 0, 0
-        noise_sq, stograd_sq, true_gradnorm, true_gradnorml1, true_gradnormlinf  = compute_sto_grad_norm(stats_loader, model, criterion, optimizer, epoch, args)
+        model.zero_grad()
+        # true_gradnorm, sto_grad_norm, sto_noise_norm, true_gradnorml1, true_gradnormlinf = 0,0,0, 0, 0
+        noise_sq, stograd_sq, stograd_linf, gradnorm_sq, true_gradnorml1, true_gradnormlinf, grad_change_sq = compute_sto_grad_norm(stats_iterator, model, criterion, 
+                                                                                                                    optimizer, epoch, args, prev_true_grad)
         sto_grad_norm = np.mean(stograd_sq)
         sto_noise_norm = np.mean(noise_sq)
+        stograd_linf = np.mean(stograd_linf)
              
     if args.save_sharpness:
-
         with open(log_sharp_file, 'a') as log_vf:
-            log_vf.write('{epoch},{sharpness: 8.5f},'.format(epoch=epoch, sharpness=sharpness) + '\n')     
+            log_vf.write('{epoch},{sharpness: 8.5f},{dir_sharpness: 8.5f},'.format(epoch=epoch, sharpness=sharpness, dir_sharpness=dir_sharpness) + '\n')     
   
-
     if args.save_noise:
-
         with open(log_noise_file, 'a') as log_tf:
-            log_tf.write('{epoch},{gradnorm:3.3f},{sto_grad_norm:3.3f},{noisenorm:3.3f},{l1norm:3.3f},{linfnorm:3.3f}\n'.format(
+            log_tf.write('{epoch},{sto_grad_norm:3.3f},{stograd_linf:3.3f},{noisenorm:3.3f},{gradnorm:3.3f},{l1norm:3.3f},{linfnorm:3.3f},{update_size:3.3f},{grad_change_sq:3.3f}\n'.format(
                 epoch=epoch,
-                gradnorm=true_gradnorm, sto_grad_norm=sto_grad_norm, 
-                noisenorm=sto_noise_norm, l1norm=true_gradnorml1, linfnorm=true_gradnormlinf))
+                gradnorm=gradnorm_sq, sto_grad_norm=sto_grad_norm, stograd_linf=stograd_linf,
+                noisenorm=sto_noise_norm, l1norm=true_gradnorml1, linfnorm=true_gradnormlinf, 
+                update_size=update_size, grad_change_sq=grad_change_sq))
             
 
 def train(train_loader, stats_loader, model, criterion, optimizer, epoch, args):
@@ -558,8 +569,22 @@ def train(train_loader, stats_loader, model, criterion, optimizer, epoch, args):
         # compute gradient and do SGD step
         optimizer.zero_grad()
         if not args.pretrain_path:
+            if i % args.stat_freq == 0:
+                print("saving stat info before backward")
+                prev_true_grad = compute_grad_epoch(iter(stats_loader), model, criterion, optimizer, epoch, args)
+
+
             loss.backward()
+
+            if i % args.stat_freq == 0:
+                print("saving stat info before update")
+                update_direction = {}
+                clone_grad(model, update_direction)
+                update_size = compute_norm(update_direction)**0.5 * optimizer.param_groups[0]['lr']
+
             optimizer.step()
+        
+
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -568,6 +593,13 @@ def train(train_loader, stats_loader, model, criterion, optimizer, epoch, args):
         if i % args.print_freq == 0:
             progress.display(i)
         
+        # # TODO: remove this
+        # if i > args.print_freq:
+        #     break
+
+        if i % args.stat_freq == 0:
+            save_stats(stats_loader, copy.deepcopy(model), criterion, optimizer, epoch, args, prev_true_grad, update_size)
+
     
     if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                                                 and args.rank % ngpus_per_node == 0):
@@ -679,7 +711,6 @@ def adjust_learning_rate(optimizer, epoch, args):
     print("Epoch %d adjusted lr to be %f" % (epoch, lr))
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
-
 
 def accuracy(output, target, topk=(1,)):
     """Computes the accuracy over the k top predictions for the specified values of k"""

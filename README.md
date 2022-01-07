@@ -14,7 +14,7 @@ It produces the ImageNet experiments in https://arxiv.org/pdf/2110.06256.pdf
 - Example usage:
 ```
 
-python train.py  PATH_TO_IMAGENET -save_noise -save_sharpness --save-dir 'resnet' --pretrain_path '/com_space/tengjiaye/'  -j 16 -noise_size 200 -sharpness_batches 200 -b 64
+python train.py  /mnt/sda1/hehaowei/ImageNet/ -save_noise -save_sharpness --save-dir '/com_space/jingzhao/logs/imagenet_kj/test' -j 16 -noise_size 5 -sharpness_batches 5 -b 64
 
 
 ```
