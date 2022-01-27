@@ -14,8 +14,14 @@ It produces the ImageNet experiments in https://arxiv.org/pdf/2110.06256.pdf
 - Example usage:
 ```
 
-python train.py  PATH_TO_IMAGENET -save_noise -save_sharpness --save-dir 'resnet' --pretrain_path '/com_space/tengjiaye/'  -j 16 -noise_size 200 -sharpness_batches 200 -b 64
+python train.py  /mnt/sda1/hehaowei/ImageNet/ -save_noise -save_sharpness --save-dir '/com_space/jingzhao/logs/imagenet_kj/imagenet-res34-nsize500-sf7000-0110' -j 8 -ls constant --lr 0.01 -noise_size 500 -sharpness_batches 500 -b 250 -sf 7000
 
+python train.py  /mnt/sda1/hehaowei/ImageNet/ -save_noise -save_sharpness --save-dir '/com_space/jingzhao/logs/imagenet_kj/imagenet-res101-nsize1000-sf70000-0112' -j 8  -noise_size 1000 -sharpness_batches 10 -b 128 -sf 70000
+
+python train.py  /mnt/sda1/hehaowei/ImageNet/ --save-dir '/com_space/jingzhao/logs/imagenet_kj/imagenet-res101-smooth-train-0124' -j 16 -b 256
+
+
+python train.py  /home/zhangjingzhao/ImageNet/ImageNet/ -save_noise -save_sharpness --save-dir '/com_space/jingzhao/logs/imagenet_kj/imagenet-res34-nsize600-sf7000-0115-cst0001' -j 16 -ls constant --lr 0.001 -noise_size 600 -sharpness_batches 600 -b 250 -sf 7000
 
 ```
 The above describes one particular plot for the constant step size training.
