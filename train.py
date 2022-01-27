@@ -453,9 +453,12 @@ def compute_sto_grad_norm(dataloader, model, criterion, optimizer, epoch, args, 
     # Turn on training mode which enables dropout.
     model.train()
     true_grads = compute_grad_epoch(dataloader, model, criterion, optimizer, epoch, args)
+<<<<<<< HEAD
     if not prev_true_grad:
         prev_true_grad = true_grads
 
+=======
+>>>>>>> bc48dcbaad3b7c0a0c30f03fa6d45e0853f187f4
     grad_change_sq, _, _ = compute_noise(true_grads, prev_true_grad)
     gradnorm_sq = compute_norm(true_grads) 
     true_gradnorml1 = compute_l1norm(true_grads) 
@@ -503,11 +506,16 @@ def save_stats(stats_loader, model, criterion, optimizer, epoch, args, prev_true
         print("Saving sharpness")
         model.zero_grad()
         dir_sharpness = dir_hessian(model, stats_iterator, criterion, args.sharpness_batches)
+<<<<<<< HEAD
         stats_iterator = iter(stats_loader)
 
         model.zero_grad()
         sharpness = eigen_hessian(model, stats_iterator, criterion, args.sharpness_batches)
         stats_iterator = iter(stats_loader)
+=======
+        model.zero_grad()
+        sharpness = eigen_hessian(model, stats_iterator, criterion, args.sharpness_batches)
+>>>>>>> bc48dcbaad3b7c0a0c30f03fa6d45e0853f187f4
 
 #         weight_names, weights = param_weights(model)
 #         weights_str = ['%4.4f' % w for w in weights]
@@ -518,11 +526,19 @@ def save_stats(stats_loader, model, criterion, optimizer, epoch, args, prev_true
         model.zero_grad()
         # true_gradnorm, sto_grad_norm, sto_noise_norm, true_gradnorml1, true_gradnormlinf = 0,0,0, 0, 0
         noise_sq, stograd_sq, stograd_linf, gradnorm_sq, true_gradnorml1, true_gradnormlinf, grad_change_sq = compute_sto_grad_norm(stats_iterator, model, criterion, 
+<<<<<<< HEAD
                                                                                                             optimizer, epoch, args, prev_true_grad)
         sto_grad_norm = np.mean(stograd_sq)
         sto_noise_norm = np.mean(noise_sq)
         stograd_linf = np.mean(stograd_linf)
         
+=======
+                                                                                                                    optimizer, epoch, args, prev_true_grad)
+        sto_grad_norm = np.mean(stograd_sq)
+        sto_noise_norm = np.mean(noise_sq)
+        stograd_linf = np.mean(stograd_linf)
+             
+>>>>>>> bc48dcbaad3b7c0a0c30f03fa6d45e0853f187f4
     if args.save_sharpness:
         with open(log_sharp_file, 'a') as log_vf:
             log_vf.write('{epoch},{sharpness: 8.5f},{dir_sharpness: 8.5f},'.format(epoch=epoch, sharpness=sharpness, dir_sharpness=dir_sharpness) + '\n')     
@@ -578,6 +594,7 @@ def train(train_loader, stats_loader, model, criterion, optimizer, epoch, args, 
 
         if not pretrained:
             if args.save_noise and i % args.stat_freq == 0:
+
                 print("saving stat info before backward")
                 prev_true_grad = compute_grad_epoch(iter(stats_loader), model, criterion, optimizer, epoch, args)
 
@@ -585,12 +602,15 @@ def train(train_loader, stats_loader, model, criterion, optimizer, epoch, args, 
             loss.backward()
 
             if args.save_noise and i % args.stat_freq == 0:
+
                 print("saving stat info before update")
                 update_direction = {}
                 clone_grad(model, update_direction)
                 update_size = compute_norm(update_direction)**0.5 * optimizer.param_groups[0]['lr']
 
             optimizer.step()
+        
+
 
 
         # measure elapsed time
@@ -605,6 +625,7 @@ def train(train_loader, stats_loader, model, criterion, optimizer, epoch, args, 
 
         if pretrained:
             break
+
 
     
     if not args.multiprocessing_distributed or (args.multiprocessing_distributed

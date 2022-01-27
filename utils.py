@@ -18,6 +18,7 @@ def compute_noise(stoc_grads, true_grads):
 
 
 def compute_norm(grads):
+
     total_grad_sq = 0
     for k in grads.keys():
         total_grad_sq += grads[k].norm(2).item() ** 2
@@ -149,6 +150,7 @@ def dir_hessian(net, dataloader, criterion, batches):
 
 
 
+
 def variance_vec_prod(net, criterion, dataloader, v):
     X, y = dataloader.X, dataloader.y
     Av, Hv, n_samples = 0, 0, len(y)
@@ -204,6 +206,7 @@ def Hv_batch(net, criterion, batch_x, batch_y, v):
     return Hv
 
 def dir_sharpness_batch(net, criterion, batch_x, batch_y, v):
+
     """
     Hessian vector multiplication
     """
